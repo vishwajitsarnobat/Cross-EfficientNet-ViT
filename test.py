@@ -1,129 +1,212 @@
-# test.py
-import matplotlib.pyplot as plt
-from sklearn import metrics
+# predict.py
+
+# --- Standard Library Imports ---
 import os
-import cv2
-import numpy as np
-import torch
-from tqdm import tqdm
-from functools import partial
-from multiprocessing import Pool, Manager
-import yaml
 import argparse
+import json
+import yaml
 
-from config import test_real_videos_paths, test_fake_videos_paths, architecture_config_path, workers
-from utils import get_video_paths_and_labels, custom_round, custom_video_round
+# --- Third-Party Library Imports ---
+import torch
+import numpy as np
+import cv2
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from termcolor import cprint
+
+# --- Local Project Imports ---
+import config
+from preprocessing.detect_faces import run_face_detection
+from preprocessing.extract_crops import run_crop_extraction
+from deepfakes_dataset import DeepFakesDataset
 from cross_efficient_vit import CrossEfficientViT
-from albumentations import Compose, Resize # <-- Import Resize directly
+from utils import custom_video_round
 
-def save_roc_curve(correct_labels, preds, model_name):
-    # ... (this function is unchanged)
-    # ...
-    pass # Keep the function as it was
-
-def create_val_transform(size):
+def create_visual_report(video_path, frame_preds, final_verdict, confidence, fps=30.0, use_time_axis=False):
     """
-    Creates a simple, robust transformation pipeline that force-resizes
-    every image to the exact target size.
+    Generates a clean, beautiful, and clutterless PNG report containing only the
+    verdict, confidence, and a gradient-filled probability graph.
     """
-    return Compose([
-        Resize(height=size, width=size)
-    ])
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    output_filename = os.path.join(config.results_path, f"{base_name}_prediction_report.png")
+    
+    frame_preds = np.array(frame_preds)
+    num_frames = len(frame_preds)
+    fake_threshold = 0.5
 
-def read_test_frames(video_path_label_tuple, videos_list, image_size):
-    video_path, label = video_path_label_tuple
-    video_id = os.path.splitext(os.path.basename(video_path))[0]
-    crops_dir = os.path.join("processed_data", "crops", video_id)
+    # --- Setup X-Axis ---
+    if use_time_axis and fps > 0:
+        x_axis = np.arange(num_frames) / fps
+        x_label = "Time (seconds)"
+    else:
+        x_axis = np.arange(num_frames)
+        x_label = "Frame Number"
 
-    if not os.path.exists(crops_dir):
+    # --- Plotting ---
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, (ax_verdict, ax_plot) = plt.subplots(
+        2, 1, figsize=(16, 9), dpi=120, 
+        gridspec_kw={'height_ratios': [1, 5]} # Top panel is smaller
+    )
+    fig.patch.set_facecolor('#f8f9fa') # Light gray background for the whole figure
+
+    # --- 1. Top Panel: Verdict and Confidence ---
+    ax_verdict.set_facecolor('#f8f9fa')
+    ax_verdict.axis('off') # No axes or borders
+    verdict_color = '#d9534f' if final_verdict == "FAKE" else '#5cb85c'
+    
+    ax_verdict.text(0.5, 0.65, f"VERDICT: {final_verdict}", ha='center', va='center', 
+                    fontsize=32, fontweight='bold', color=verdict_color)
+    ax_verdict.text(0.5, 0.25, f"Confidence: {confidence:.2%}", ha='center', va='center', 
+                    fontsize=20, color='#343a40') # Dark gray text
+
+    # --- 2. Bottom Panel: The Graph ---
+    ax_plot.set_facecolor('#ffffff') # White background for the plot area
+    
+    # Plot the main probability line
+    ax_plot.plot(x_axis, frame_preds, color='#007bff', linewidth=2.5, label='Fake Probability')
+    
+    # Add the threshold line
+    ax_plot.axhline(y=fake_threshold, color='#343a40', linestyle='--', linewidth=1.5, alpha=0.7, 
+                    label=f'Fake Threshold ({fake_threshold})')
+    
+    # Add the beautiful red/green gradient fill
+    ax_plot.fill_between(x_axis, fake_threshold, frame_preds, where=frame_preds >= fake_threshold, 
+                         facecolor='#d9534f', interpolate=True, alpha=0.4)
+    ax_plot.fill_between(x_axis, fake_threshold, frame_preds, where=frame_preds < fake_threshold, 
+                         facecolor='#5cb85c', interpolate=True, alpha=0.4)
+
+    # Set titles and labels with padding for a clean look
+    ax_plot.set_title('Frame-by-Frame Fake Probability Analysis', fontsize=18, fontweight='bold', pad=20)
+    ax_plot.set_xlabel(x_label, fontsize=14)
+    ax_plot.set_ylabel('Probability Score', fontsize=14)
+    ax_plot.set_ylim(0, 1)
+    if num_frames > 1:
+        ax_plot.set_xlim(0, x_axis[-1])
+    
+    # Customize ticks and spines for a cleaner look
+    ax_plot.tick_params(axis='both', which='major', labelsize=12)
+    ax_plot.spines['top'].set_visible(False)
+    ax_plot.spines['right'].set_visible(False)
+    
+    ax_plot.legend(fontsize=12)
+    
+    plt.tight_layout(pad=3.0)
+    plt.savefig(output_filename)
+    plt.close()
+    return output_filename
+
+def save_json_report(video_path, verdict, confidence, frame_preds, fps, total_frames):
+    """Saves a detailed JSON report."""
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    output_filename = os.path.join(config.results_path, f"{base_name}_prediction_report.json")
+    duration = total_frames / fps if fps > 0 else 0
+
+    report = {
+        'video_information': {
+            'filename': os.path.basename(video_path),
+            'path': video_path,
+            'duration_seconds': round(duration, 2),
+            'total_frames': total_frames,
+            'frames_with_faces': len(frame_preds)
+        },
+        'prediction_summary': {
+            'verdict': verdict,
+            'confidence': round(confidence, 4)
+        },
+        'frame_by_frame_results': {
+            'fake_probabilities': [round(float(p), 4) for p in frame_preds]
+        }
+    }
+
+    with open(output_filename, 'w') as f:
+        json.dump(report, f, indent=4)
+    return output_filename
+
+def main():
+    parser = argparse.ArgumentParser(description="Predict if a video is a deepfake.")
+    parser.add_argument("video_path", type=str, help="Path to the video file to be analyzed.")
+    parser.add_argument("--model_path", type=str, default=config.test_model_path, 
+                        help="Path to the trained model checkpoint.")
+    parser.add_argument("--time_axis", action="store_true", 
+                        help="Use time in seconds for the x-axis of the graph instead of frame numbers.")
+    opt = parser.parse_args()
+
+    if not os.path.exists(opt.video_path):
+        cprint(f"Error: Video file not found at '{opt.video_path}'", 'red')
+        return
+
+    # Preprocessing
+    run_face_detection([opt.video_path])
+    run_crop_extraction([opt.video_path])
+
+    # Setup
+    os.makedirs(config.results_path, exist_ok=True)
+    with open(config.architecture_config_path, 'r') as ymlfile:
+        arch_config = yaml.safe_load(ymlfile)
+    image_size = arch_config['model']['image-size']
+
+    transform = DeepFakesDataset(frame_label_list=[], image_size=image_size, mode='validation').create_val_transform(image_size)
+
+    # Load Model
+    model = CrossEfficientViT(config=arch_config)
+    if not os.path.exists(opt.model_path):
+        cprint(f"Error: Model file not found at '{opt.model_path}'", 'red')
+        return
+    model.load_state_dict(torch.load(opt.model_path, map_location=config.device))
+    model.eval().to(config.device)
+
+    # Get video info for reports
+    cap = cv2.VideoCapture(opt.video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+
+    # Load Frames
+    video_id = os.path.splitext(os.path.basename(opt.video_path))[0]
+    crops_dir = os.path.join(config.output_path, "crops", video_id)
+    
+    if not os.path.exists(crops_dir) or not os.listdir(crops_dir):
+        cprint(f"Error: No faces were detected in this video. Cannot predict.", 'red')
         return
 
     frames = []
-    transform = create_val_transform(image_size)
-    for frame_file in os.listdir(crops_dir):
-        frame_path = os.path.join(crops_dir, frame_file)
-        image = cv2.imread(frame_path, cv2.IMREAD_COLOR)
-
-        if image is None:
-            continue
-        try:
-            transformed_image = transform(image=image)['image']
-            frames.append(transformed_image)
-        except Exception as e:
-            print(f"Warning: Failed to transform image {frame_path}. Error: {e}. Skipping.")
-
-    if frames:
-        videos_list.append({'frames': frames, 'label': label, 'name': video_id})
-
-# --- Main body is now robust ---
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', required=True, type=str, help='Path to the trained model checkpoint.')
-    parser.add_argument('--batch_size', type=int, default=32, help="Batch size for prediction.")
-    opt = parser.parse_args()
-    print(opt)
-
-    with open(architecture_config_path, 'r') as ymlfile:
-        config = yaml.safe_load(ymlfile)
+    for frame_file in sorted(os.listdir(crops_dir)):
+        image = cv2.imread(os.path.join(crops_dir, frame_file))
+        if image is None: continue
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        frames.append(transform(image=image_rgb)['image'])
     
-    model = CrossEfficientViT(config=config)
-    model.load_state_dict(torch.load(opt.model_path))
-    model.eval()
-    model = model.cuda()
-    model_name = os.path.splitext(os.path.basename(opt.model_path))[0]
-
-    print("Loading test video paths...")
-    test_videos_paths = get_video_paths_and_labels(test_real_videos_paths, test_fake_videos_paths)
-    
-    mgr = Manager()
-    videos_data = mgr.list()
-
-    print("Reading test frames...")
-    image_size = config['model']['image-size']
-    with Pool(processes=workers) as p:
-        with tqdm(total=len(test_videos_paths)) as pbar:
-            for _ in p.imap_unordered(partial(read_test_frames, videos_list=videos_data, image_size=image_size), test_videos_paths):
-                pbar.update()
-
-    predictions = []
-    correct_labels = []
-    video_count = len(videos_data)
-
-    with torch.no_grad():
-        for video_info in tqdm(videos_data, desc="Predicting on test videos"):
-            video_frames = video_info['frames']
-            frame_preds = []
-            
-            for i in range(0, len(video_frames), opt.batch_size):
-                batch = video_frames[i : i + opt.batch_size]
-                if not batch: continue
-
-                tensor_batch = torch.from_numpy(np.array(batch)).cuda().float()
-
-                if tensor_batch.shape[-1] == 3:
-                    tensor_batch = tensor_batch.permute(0, 3, 1, 2)
-                
-                pred = model(tensor_batch)
-                frame_preds.extend(torch.sigmoid(pred).cpu().numpy().flatten())
-
-            if frame_preds:
-                video_pred = custom_video_round(frame_preds)
-                predictions.append(video_pred)
-                correct_labels.append(video_info['label'])
-
-    print(f"\nSuccessfully processed {len(correct_labels)} out of {video_count} videos.")
-
-    # --- Metrics ---
-    if not correct_labels:
-        print("Could not process any videos. No metrics to calculate.")
-    else:
-        accuracy = metrics.accuracy_score(correct_labels, custom_round(np.asarray(predictions)))
-        f1 = metrics.f1_score(correct_labels, custom_round(np.asarray(predictions)))
-        print(f"\n--- Test Results for {model_name} ---")
-        print(f"Accuracy: {accuracy:.4f}")
-        print(f"F1 Score: {f1:.4f}")
+    if not frames:
+        cprint(f"Error: Failed to load valid frames from '{crops_dir}'.", 'red')
+        return
         
-        # save_roc_curve(correct_labels, predictions, model_name) # You can uncomment this if you fix the function
-        cm = metrics.confusion_matrix(correct_labels, custom_round(np.asarray(predictions)))
-        print("Confusion Matrix:")
-        print(cm)
+    frames_tensor = torch.stack(frames).to(config.device)
+
+    # Predict
+    frame_preds = []
+    with torch.no_grad():
+        for i in tqdm(range(0, len(frames_tensor), config.test_batch_size), desc="Analyzing Frames"):
+            batch = frames_tensor[i : i + config.test_batch_size]
+            pred = torch.sigmoid(model(batch))
+            frame_preds.extend(pred.cpu().numpy().flatten().tolist())
+
+    # Process results
+    video_level_pred_score = custom_video_round(frame_preds)
+    final_verdict = "FAKE" if video_level_pred_score > 0.5 else "REAL"
+    confidence = video_level_pred_score if final_verdict == "FAKE" else 1 - video_level_pred_score
+
+    # --- Final Console Output ---
+    verdict_color = 'red' if final_verdict == "FAKE" else 'green'
+    cprint(f"\nVerdict: {final_verdict}", verdict_color, attrs=['bold'])
+    cprint(f"Confidence: {confidence:.2%}\n", verdict_color)
+
+    # --- Generate and Save Reports ---
+    report_path = create_visual_report(opt.video_path, frame_preds, final_verdict, confidence, fps, opt.time_axis)
+    json_path = save_json_report(opt.video_path, final_verdict, confidence, frame_preds, fps, total_frames)
+    
+    cprint(f"✓ Visual report saved to: {report_path}", 'cyan')
+    cprint(f"✓ JSON data saved to:   {json_path}", 'cyan')
+
+if __name__ == "__main__":
+    main()
