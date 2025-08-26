@@ -88,7 +88,7 @@ class DeepFakesDataset(torch.utils.data.Dataset):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # --- MAJOR IMPROVEMENT No. 2: Separate LR for Fine-tuning ---
-    parser.add_argument('--lr', default=1e-4, type=float, help='Learning rate for the optimizer.')
+    parser.add_argument('--lr', default=1e-5, type=float, help='Learning rate for the optimizer.')
     parser.add_argument('--num_epochs', default=15, type=int, help='Number of training epochs.')
     parser.add_argument('--patience', type=int, default=5, help="Epochs to wait for validation loss improvement.")
     opt = parser.parse_args()

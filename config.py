@@ -4,16 +4,16 @@ import os
 # --- PATHS ---
 
 # Directory where preprocessed data (bounding boxes, crops) will be saved.
-output_path = "processed_data"
+output_path = "/mnt/data/Cross-EfficientNet-data/processed_data"
 
 # Directories containing your custom training and validation videos.
 # The training script will automatically split this data for validation.
-real_videos_paths = ["/home/vishwajit/Workspace/NTRO/Celeb-DF-V2/train-real"]
-fake_videos_paths = ["/home/vishwajit/Workspace/NTRO/Celeb-DF-V2/train-fake"]
+real_videos_paths = ["/mnt/data/Cross-EfficientNet-data/train_real"]
+fake_videos_paths = ["/mnt/data/Cross-EfficientNet-data/train_fake"]
 
 # Directories containing your custom test videos.
-test_real_videos_paths = ["/home/vishwajit/Workspace/NTRO/Celeb-DF-V2/test-real"]
-test_fake_videos_paths = ["/home/vishwajit/Workspace/NTRO/Celeb-DF-V2/test-fake"]
+test_real_videos_paths = ["/mnt/data/Cross-EfficientNet-data/test_real"]
+test_fake_videos_paths = ["/mnt/data/Cross-EfficientNet-data/test_fake"]
 
 # Path to the model architecture configuration file.
 architecture_config_path = "configs/architecture.yaml"
