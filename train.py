@@ -2,209 +2,235 @@
 import torch
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
-import numpy as np
 import os
 import collections
 from tqdm import tqdm
-from functools import partial
-import cv2 # <-- Make sure cv2 is imported
-import math
-import yaml
-import argparse
 from multiprocessing import Pool
+import yaml
+import json # Import the json library
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+from termcolor import cprint
 
-# Import settings from the central configuration file
-from config import (
-    real_videos_paths, fake_videos_paths, output_path, models_path,
-    resume_model_path, architecture_config_path, validation_split, workers
-)
+# Import from our generalized project files
+import config
+from preprocessing.detect_faces import run_face_detection
+from preprocessing.extract_crops import run_crop_extraction
+from deepfakes_dataset import DeepFakesDataset
 from cross_efficient_vit import CrossEfficientViT
-from deepfakes_dataset import DeepFakesDataset # We will rely on its changes
 from torch.optim import lr_scheduler
-from utils import get_video_paths_and_labels, check_correct, get_n_params, shuffle_dataset
+from utils import get_media_paths_and_labels, get_all_media_paths, check_correct, get_n_params
 
+MIN_TRAIN_CROPS = 100
+MIN_VAL_CROPS = 20
 
-# --- MAJOR IMPROVEMENT No. 1: Scalable Data Loading ---
-# We no longer load images into memory. We just get their file paths.
-def get_frame_paths(video_path_label_tuple):
-    """
-    For a given video, returns a list of (frame_path, label) tuples.
-    This is memory-efficient as it only deals with strings.
-    """
-    video_path, label = video_path_label_tuple
-    video_id = os.path.splitext(os.path.basename(video_path))[0]
-    crops_dir = os.path.join(output_path, "crops", video_id)
-
+def get_crop_paths(media_path_label_tuple):
+    """Worker function to find all crop image paths for a given media file."""
+    media_path, label = media_path_label_tuple
+    media_id = os.path.splitext(os.path.basename(media_path))[0]
+    crops_dir = os.path.join(config.output_path, "crops", media_id)
     if not os.path.exists(crops_dir):
         return []
+    return [(os.path.join(crops_dir, f), label) for f in os.listdir(crops_dir)]
 
-    frame_paths = []
-    for frame_file in os.listdir(crops_dir):
-        frame_paths.append((os.path.join(crops_dir, frame_file), label))
-    return frame_paths
-
-
-# We need to modify DeepFakesDataset to handle file paths
-# Let's redefine it here for clarity, or you can modify the original file.
-class DeepFakesDataset(torch.utils.data.Dataset):
-    def __init__(self, frame_label_list, image_size, mode='train'):
-        self.frame_label_list = frame_label_list
-        self.image_size = image_size
-        self.mode = mode
-        
-        # We rely on the albumentations transforms defined in the original deepfakes_dataset.py
-        from deepfakes_dataset import DeepFakesDataset as OriginalDataset
-        self.transform_lib = OriginalDataset(np.array([]), np.array([]), image_size)
-
-    def __len__(self):
-        return len(self.frame_label_list)
-
-    def __getitem__(self, index):
-        frame_path, label = self.frame_label_list[index]
-
-        # Load image from disk
-        image = cv2.imread(frame_path, cv2.IMREAD_COLOR)
-        if image is None:
-            # Handle corrupted image by returning a dummy tensor
-            print(f"Warning: Could not read {frame_path}. Returning dummy data.")
-            return torch.zeros((3, self.image_size, self.image_size)), torch.tensor(0.0, dtype=torch.float32)
-
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) # Albumentations expects RGB
-
-        if self.mode == 'train':
-            transform = self.transform_lib.create_train_transforms(self.image_size)
-        else:
-            transform = self.transform_lib.create_val_transform(self.image_size)
-        
-        image = transform(image=image)['image']
-        
-        # Transpose from HWC to CHW format for PyTorch
-        image = np.transpose(image, (2, 0, 1)).astype(np.float32)
-        
-        return torch.from_numpy(image), torch.tensor(label, dtype=torch.float32)
-
-
-# Main body
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    # --- MAJOR IMPROVEMENT No. 2: Separate LR for Fine-tuning ---
-    parser.add_argument('--lr', default=1e-4, type=float, help='Learning rate for the optimizer.')
-    parser.add_argument('--num_epochs', default=15, type=int, help='Number of training epochs.')
-    parser.add_argument('--patience', type=int, default=5, help="Epochs to wait for validation loss improvement.")
-    opt = parser.parse_args()
-    print(opt)
-
-    with open(architecture_config_path, 'r') as ymlfile:
-        config = yaml.safe_load(ymlfile)
-
-    # --- 1. DATA PATH GATHERING (NOW MEMORY-EFFICIENT) ---
-    print("Loading video paths...")
-    all_videos = get_video_paths_and_labels(real_videos_paths, fake_videos_paths)
-    train_videos, val_videos = train_test_split(all_videos, test_size=validation_split, random_state=42, stratify=[label for _, label in all_videos])
+# --- MODIFIED: Metrics plotting function now takes the current epoch ---
+def plot_and_save_metrics(history, save_path):
+    """Saves plots for training/validation loss and accuracy and updates history JSON."""
+    # 1. Save Plots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    fig.suptitle('Training Metrics')
     
-    print("Gathering frame paths (this is fast)...")
-    train_frame_paths = []
-    val_frame_paths = []
-    
-    # Use multiprocessing to quickly gather all frame paths
-    with Pool(processes=workers) as p:
-        # Get train paths
-        results = list(tqdm(p.imap(get_frame_paths, train_videos), total=len(train_videos), desc="Scanning train frames"))
-        for res in results: train_frame_paths.extend(res)
-        
-        # Get validation paths
-        results = list(tqdm(p.imap(get_frame_paths, val_videos), total=len(val_videos), desc="Scanning val frames"))
-        for res in results: val_frame_paths.extend(res)
+    epochs = range(1, len(history['train_loss']) + 1)
 
-    print(f"Found {len(train_frame_paths)} training frames and {len(val_frame_paths)} validation frames.")
-    
-    # --- 2. DATASET PREPARATION ---
-    train_counters = collections.Counter(label for _, label in train_frame_paths)
-    class_weights = train_counters[0] / train_counters[1] if train_counters[1] > 0 else 1.0
-    print(f"Training distribution: {train_counters}")
-    print(f"Using class weight for FAKE class: {class_weights:.2f}")
+    ax1.plot(epochs, history['train_loss'], 'bo-', label='Train Loss')
+    ax1.plot(epochs, history['val_loss'], 'ro-', label='Validation Loss')
+    ax1.set_title('Loss vs. Epochs'); ax1.set_xlabel('Epoch'); ax1.legend()
 
-    # Create PyTorch Datasets using the memory-efficient class
-    train_dataset = DeepFakesDataset(train_frame_paths, config['model']['image-size'], mode='train')
-    validation_dataset = DeepFakesDataset(val_frame_paths, config['model']['image-size'], mode='validation')
-
-    # Create DataLoaders
-    dl = DataLoader(train_dataset, batch_size=config['training']['bs'], shuffle=True, num_workers=workers)
-    val_dl = DataLoader(validation_dataset, batch_size=config['training']['bs'], shuffle=False, num_workers=workers)
-
-    # --- 3. MODEL, OPTIMIZER, AND LOSS ---
-    model = CrossEfficientViT(config=config)
-    model = model.cuda()
+    ax2.plot(epochs, history['train_acc'], 'bo-', label='Train Accuracy')
+    ax2.plot(epochs, history['val_acc'], 'ro-', label='Validation Accuracy')
+    ax2.set_title('Accuracy vs. Epochs'); ax2.set_xlabel('Epoch'); ax2.legend()
     
-    # Use the new --lr argument for the optimizer
-    optimizer = torch.optim.SGD(model.parameters(), lr=opt.lr, weight_decay=config['training']['weight-decay'])
-    scheduler = lr_scheduler.StepLR(optimizer, step_size=config['training']['step-size'], gamma=config['training']['gamma'])
-    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([class_weights]).cuda())
-    
-    starting_epoch = 0
-    if resume_model_path and os.path.exists(resume_model_path):
-        print(f"Loading model from: {resume_model_path} for fine-tuning.")
-        model.load_state_dict(torch.load(resume_model_path))
-        # We don't parse the epoch from the filename anymore, we start from 0 for fine-tuning
+    plt.savefig(os.path.join(save_path, "training_plots.png"))
+    plt.close()
+
+    # 2. Save History to JSON
+    # Convert defaultdict to a regular dict for clean JSON output
+    history_dict = dict(history)
+    with open(os.path.join(save_path, "training_history.json"), 'w') as f:
+        json.dump(history_dict, f, indent=4)
+
+    print(f"Updated training plots and history JSON in '{save_path}'")
+
+def plot_confusion_matrix(labels, preds, save_path, epoch):
+    """Saves a confusion matrix plot for the best validation epoch."""
+    cm = confusion_matrix(labels, preds)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Real', 'Fake'], yticklabels=['Real', 'Fake'])
+    plt.title(f'Best Validation Confusion Matrix (Epoch {epoch})')
+    plt.xlabel('Predicted'); plt.ylabel('Actual')
+    save_file = os.path.join(save_path, "best_validation_confusion_matrix.png")
+    plt.savefig(save_file)
+    plt.close()
+    print(f"Saved best confusion matrix plot to {save_file}")
+
+def main():
+    cprint(f"--- Scope: Training --- [MODE: {config.MODE.upper()}]", "yellow")
+    train_val_media_paths = get_all_media_paths(config.real_data_paths, config.fake_data_paths)
+
+    if not train_val_media_paths:
+        cprint("Error: No media files found in specified data directories.", "red")
+        return
+
+    if config.run_preprocessing:
+        run_face_detection(train_val_media_paths)
+        run_crop_extraction(train_val_media_paths)
     else:
-        print("No checkpoint loaded, training from scratch.")
+        print("Skipping preprocessing as per config.")
 
+    os.makedirs(config.models_path, exist_ok=True)
+    os.makedirs(config.results_path, exist_ok=True)
+    
+    with open(config.architecture_config_path, 'r') as ymlfile:
+        arch_config = yaml.safe_load(ymlfile)
+    image_size = arch_config['model']['image-size']
+
+    print("Gathering crop paths for training and validation sets...")
+    train_val_media_with_labels = get_media_paths_and_labels(config.real_data_paths, config.fake_data_paths)
+    
+    if len(train_val_media_with_labels) < 2:
+        cprint("Error: Not enough media files to create a train/validation split.", "red")
+        return
+
+    train_media, val_media = train_test_split(
+        train_val_media_with_labels, 
+        test_size=config.validation_split, 
+        random_state=42, 
+        stratify=[lbl for _, lbl in train_val_media_with_labels]
+    )
+
+    with Pool(processes=config.train_workers) as p:
+        train_crops = list(tqdm(p.imap(get_crop_paths, train_media), total=len(train_media), desc="Loading train crop paths"))
+        val_crops = list(tqdm(p.imap(get_crop_paths, val_media), total=len(val_media), desc="Loading val crop paths"))
+
+    train_crop_paths = [item for sublist in train_crops for item in sublist]
+    val_crop_paths = [item for sublist in val_crops for item in sublist]
+    print(f"Found {len(train_crop_paths)} training crops and {len(val_crop_paths)} validation crops.")
+
+    if len(train_crop_paths) < MIN_TRAIN_CROPS or len(val_crop_paths) < MIN_VAL_CROPS:
+        cprint("Training cannot proceed due to insufficient data after preprocessing.", "red", attrs=['bold'])
+        if len(train_crop_paths) < MIN_TRAIN_CROPS:
+            cprint(f" - Found {len(train_crop_paths)} training crops, but require at least {MIN_TRAIN_CROPS}.", "red")
+        if len(val_crop_paths) < MIN_VAL_CROPS:
+            cprint(f" - Found {len(val_crop_paths)} validation crops, but require at least {MIN_VAL_CROPS}.", "red")
+        cprint("Action: Run `uv run audit_preprocessing.py` to diagnose your dataset.", "yellow")
+        return
+
+    train_counters = collections.Counter(label for _, label in train_crop_paths)
+    class_weights = train_counters[0] / train_counters[1] if train_counters[1] > 0 else 1.0
+
+    train_dataset = DeepFakesDataset(train_crop_paths, image_size, mode='train')
+    val_dataset = DeepFakesDataset(val_crop_paths, image_size, mode='validation')
+
+    dl = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.train_workers)
+    val_dl = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.train_workers)
+
+    model = CrossEfficientViT(config=arch_config).to(config.device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=arch_config['training']['weight-decay'])
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=arch_config['training']['step-size'], gamma=arch_config['training']['gamma'])
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([class_weights]).to(config.device))
+
+    model_to_load = config.resume_model_path
+    if model_to_load is None:
+        potential_resume_path = os.path.join(config.models_path, "best_model.pth")
+        if os.path.exists(potential_resume_path):
+            cprint(f"Found existing 'best_model.pth'. Resuming training.", "yellow")
+            model_to_load = potential_resume_path
+    
+    if model_to_load and os.path.exists(model_to_load):
+        cprint(f"Loading weights from: {model_to_load}", "green")
+        model.load_state_dict(torch.load(model_to_load, map_location=config.device))
+    else:
+        cprint("Starting training from scratch.", "green")
+    
     print(f"Model Parameters: {get_n_params(model)}")
 
-    # --- 4. TRAINING LOOP ---
-    not_improved_loss = 0
-    previous_loss = math.inf
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    history = collections.defaultdict(list)
 
-    for t in range(starting_epoch, opt.num_epochs):
-        model.train()
-        total_loss = 0
-        train_correct = 0
+    for epoch in range(config.num_epochs):
+        current_epoch = epoch + 1
+        print(f"\n--- EPOCH {current_epoch}/{config.num_epochs} ---")
         
-        pbar = tqdm(dl, desc=f'EPOCH {t+1}/{opt.num_epochs} [TRAIN]')
-        for images, labels in pbar:
-            images, labels = images.cuda(), labels.cuda().unsqueeze(1)
+        # --- Training Phase ---
+        model.train()
+        total_loss, train_correct, total_train_samples = 0, 0, 0
+        for images, labels in tqdm(dl, desc='TRAIN'):
+            images, labels = images.to(config.device), labels.to(config.device).unsqueeze(1)
             optimizer.zero_grad()
-            
             y_pred = model(images)
             loss = loss_fn(y_pred, labels)
             loss.backward()
             optimizer.step()
             
-            total_loss += loss.item()
+            total_loss += loss.item() * images.size(0)
             corrects, _, _ = check_correct(y_pred, labels)
             train_correct += corrects
-            
-            pbar.set_postfix({'loss': f'{total_loss / (pbar.n + 1):.4f}', 'acc': f'{train_correct / ((pbar.n + 1) * config["training"]["bs"]):.4f}'})
-
+            total_train_samples += len(labels)
+        
+        avg_train_loss = total_loss / total_train_samples if total_train_samples > 0 else 0
+        avg_train_acc = train_correct / total_train_samples if total_train_samples > 0 else 0
+        history['train_loss'].append(avg_train_loss)
+        history['train_acc'].append(avg_train_acc)
         scheduler.step()
 
-        # Validation loop
+        # --- Validation Phase ---
         model.eval()
-        total_val_loss = 0
-        val_correct = 0
+        total_val_loss, val_correct, total_val_samples = 0, 0, 0
+        all_preds, all_labels = [], []
         with torch.no_grad():
-            pbar_val = tqdm(val_dl, desc=f'EPOCH {t+1}/{opt.num_epochs} [VAL]')
-            for val_images, val_labels in pbar_val:
-                val_images, val_labels = val_images.cuda(), val_labels.cuda().unsqueeze(1)
-                val_pred = model(val_images)
-                val_loss = loss_fn(val_pred, val_labels)
-                total_val_loss += val_loss.item()
-                corrects, _, _ = check_correct(val_pred, val_labels)
-                val_correct += corrects
+            for images, labels in tqdm(val_dl, desc='VALIDATION'):
+                images, labels = images.to(config.device), labels.to(config.device).unsqueeze(1)
+                y_pred = model(images)
+                loss = loss_fn(y_pred, labels)
+                total_val_loss += loss.item() * images.size(0)
                 
-                pbar_val.set_postfix({'val_loss': f'{total_val_loss / (pbar_val.n + 1):.4f}', 'val_acc': f'{val_correct / len(validation_dataset):.4f}'})
+                corrects, preds_tensor, _ = check_correct(y_pred, labels)
+                val_correct += corrects
+                all_preds.extend(preds_tensor.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy().flatten())
+                total_val_samples += len(labels)
+
+        avg_val_loss = total_val_loss / total_val_samples if total_val_samples > 0 else 0
+        avg_val_acc = val_correct / total_val_samples if total_val_samples > 0 else 0
+        history['val_loss'].append(avg_val_loss)
+        history['val_acc'].append(avg_val_acc)
+        print(f"Epoch {current_epoch} Summary | Train Loss: {avg_train_loss:.4f}, Train Acc: {avg_train_acc:.4f} | Val Loss: {avg_val_loss:.4f}, Val Acc: {avg_val_acc:.4f}")
         
-        avg_val_loss = total_val_loss / len(val_dl)
-        if avg_val_loss < previous_loss:
-            previous_loss = avg_val_loss
-            not_improved_loss = 0
-            print(f"Validation loss improved to {avg_val_loss:.4f}. Saving model.")
-            os.makedirs(models_path, exist_ok=True)
-            # Let's save with a more descriptive name
-            torch.save(model.state_dict(), os.path.join(models_path, f"finetuned_checkpoint_{t}.pth"))
+        plot_and_save_metrics(history, config.results_path)
+        
+        print("\n--- Validation Report ---")
+        print(classification_report(all_labels, all_preds, target_names=['Real', 'Fake'], zero_division=0))
+        cm = confusion_matrix(all_labels, all_preds)
+        print("Confusion Matrix (Real: 0, Fake: 1):\n", cm)
+        print("-------------------------\n")
+        
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), os.path.join(config.models_path, "best_model.pth"))
+            cprint(f"Validation loss improved to {avg_val_loss:.4f}. Model saved to 'best_model.pth'.", "green")
+            plot_confusion_matrix(all_labels, all_preds, config.results_path, epoch=current_epoch)
         else:
-            not_improved_loss += 1
-            print(f"Validation loss did not improve. Count: {not_improved_loss}/{opt.patience}")
-            if not_improved_loss >= opt.patience:
-                print("Stopping early due to validation loss not improving.")
+            epochs_no_improve += 1
+            if epochs_no_improve >= config.early_stopping_patience:
+                print(f"Early stopping! Validation loss has not improved for {epochs_no_improve} epochs.")
                 break
+    
+    print("\n--- Training Finished ---")
+    torch.save(model.state_dict(), os.path.join(config.models_path, "final_model.pth"))
+    print("Final model saved to 'final_model.pth'.")
+
+if __name__ == "__main__":
+    main()

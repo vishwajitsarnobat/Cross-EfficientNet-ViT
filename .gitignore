@@ -10,3 +10,5 @@ wheels/
 .venv
 /models/
 /processed_data/
+/results/
+/data/
